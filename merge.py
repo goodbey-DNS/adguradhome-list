@@ -13,6 +13,8 @@
 - hosts 转换：0.0.0.0/127.0.0.1/::1 条目（含行尾注释、多余空格）-> ||domain^
 - dnsmasq 转换：address=/domain/0.0.0.0 -> ||domain^
 - 通配/纯域名转换：*.example.com、example.com -> ||example.com^
+- 规则形态收敛：仅保留 ||domain^；||... 里 $ 及其后的修饰符一律丢弃；带路径的
+  |http/||domain/path 规则与 /正则/ 规则丢弃；含 * 的通配规则原样保留；统一小写
 - 去重：大小写不敏感的完全去重 + 父域已拦截时剔除冗余子域规则
 """
 import glob
@@ -73,6 +75,19 @@ def domain_rule(d):
         return f"||{d}^"
     return None
 
+def block_rule(line):
+    """|| 开头的规则：丢弃 $ 及其后修饰符，统一收敛为小写 ||domain^；无法收敛则丢弃"""
+    pattern = line.split("$", 1)[0].strip().lower()
+    body = pattern[2:]
+    if "*" in body:            # 含通配的规则无法收敛成纯域名，原样保留（仅统一小写）
+        return pattern
+    if "/" in body:            # 带路径的 URL 规则，AdGuard Home 按主机名匹配用不到
+        return None
+    if body.endswith("^"):
+        body = body[:-1]
+    body = body.rstrip("|")    # ||domain| 这类尾锚点写法
+    return domain_rule(body)   # 复用域名校验：补 ^，丢弃非法域名与本机域名
+
 def normalize(line):
     line = line.strip()
     # 空行、注释行（! # [Adblock Plus] 等来源标记）
@@ -92,9 +107,12 @@ def normalize(line):
     m = HOSTS_RE.match(line)
     if m:
         return domain_rule(m.group(1))
-    # 标准拦截类 adblock 规则（||domain^、|http、正则 /.../）
-    if line.startswith(("||", "|http")) or (line.startswith("/") and line.endswith("/")):
-        return line
+    # 标准拦截类 adblock 规则：统一收敛成 ||domain^
+    if line.startswith("||"):
+        return block_rule(line)
+    # URL/路径类规则与正则规则：不是 ||domain^，丢弃
+    if line.startswith("|http") or (line.startswith("/") and line.endswith("/")):
+        return None
     # 通配或纯域名
     return domain_rule(line)
 
