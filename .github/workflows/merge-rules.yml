@@ -16,32 +16,37 @@ concurrency:
 
 jobs:
   merge:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04     # 固定镜像版本，不随 ubuntu-latest 漂移，长期稳定
+    timeout-minutes: 60       # 兜底：任务异常挂起时自动终止
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5   # Node 24 运行时，无弃用警告
 
       - name: 安装 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.12"   # 固定版本，长期稳定
 
       - name: 合并规则
         run: python merge.py
 
-      - name: 提交并推送
+      - name: 推送结果到 filter 分支（单提交强推，仓库体积不膨胀）
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add adguard-filter.txt
-          if git diff --cached --quiet; then
-            echo "规则无变化，跳过提交"
+          if [ -z "$(git status --porcelain -- 'adguard-filter*.txt')" ]; then
+            echo "规则无变化，跳过推送"
             exit 0
           fi
-          git commit -m "chore: update merged filter [skip ci]"
-          # 冲突处理：推送前先 rebase 远端，失败自动重试 3 次
+          # 输出到独立 filter 分支：每天 50M+ 文本若累积在主分支历史中，
+          # 仓库会无限膨胀直至超限。孤立分支 + 强推保证历史始终只有 1 个提交。
+          git checkout --orphan filter_new
+          git rm -rf --cached . >/dev/null 2>&1 || true
+          git add adguard-filter*.txt
+          git commit -m "chore: update merged filter $(date -u +%Y-%m-%d)"
+          # 冲突处理：强推无需 rebase，失败自动重试 3 次
           for i in 1 2 3; do
-            git pull --rebase origin HEAD && git push && exit 0
+            git push -f origin filter_new:filter && exit 0
             echo "推送失败，5 秒后重试（第 $i 次）"
             sleep 5
           done
