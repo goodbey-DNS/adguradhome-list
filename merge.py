@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""合并多个上游规则源 -> 去重 -> 清洗 -> 输出 AdGuard Home 拦截规则（仅阻止规则，不含白名单）"""
+"""合并多个上游规则源 -> 去重 -> 清洗 -> 输出 AdGuard Home 拦截规则
+
+设计目标：稳定优先、长期免维护、支持大量规则源、支持超大输出（50M+）。
+- 仅使用 Python 标准库，无第三方依赖
+- 单个源失败自动跳过并重试，不中断整体任务
+- 输出超过 CHUNK_LINES 行时自动分片为多个文件，规避 GitHub 单文件大小限制
+
+清洗与去重策略：
+- 白名单剔除：@@ 开头的例外规则、#@# 元素白名单全部丢弃
+- 装饰规则剔除：## #?# #$# 等浏览器端元素隐藏/CSS 注入规则（AdGuard Home 不支持）
+- hosts 转换：0.0.0.0/127.0.0.1/::1 条目（含行尾注释、多余空格）-> ||domain^
+- dnsmasq 转换：address=/domain/0.0.0.0 -> ||domain^
+- 通配/纯域名转换：*.example.com、example.com -> ||example.com^
+- 去重：大小写不敏感的完全去重 + 父域已拦截时剔除冗余子域规则
+"""
+import glob
+import os
 import re
 import sys
 import time
@@ -7,17 +23,24 @@ import urllib.request
 from datetime import datetime, timezone
 
 SOURCES_FILE = "sources.txt"
-OUTPUT_FILE = "adguard-filter.txt"
+OUTPUT_SINGLE = "adguard-filter.txt"        # 规则量不大时的单文件输出
+OUTPUT_PART_FMT = "adguard-filter-{}.txt"   # 超大时分片输出（从 1 开始编号）
+CHUNK_LINES = 800_000                        # 每片约 80 万行（约 35~45MB）
 
 COMMENT_PREFIXES = ("!", "#", "[")
-HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1)\s+([^\s#]+)")
+COSMETIC_TOKENS = ("##", "#@#", "#?#", "#$#", "#@%#")
+LOCAL_NAMES = {"localhost", "local", "broadcasthost", "localhost.localdomain"}
+HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1|::1)\s+([^\s#]+)")
+DNSMASQ_RE = re.compile(r"^(?:address|server)=/([^/\s]+)/")
 DOMAIN_RE = re.compile(r"^(?:[a-z0-9_-]+\.)+[a-z]{2,}$", re.IGNORECASE)
+IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+PURE_DOMAIN_RULE_RE = re.compile(r"^\|\|([a-z0-9._-]+)\^$")
 
 def fetch(url, retries=2):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=120) as r:
                 return r.read().decode("utf-8", errors="ignore")
         except Exception as e:
             print(f"  [warn] 第 {attempt + 1} 次拉取失败: {e}", file=sys.stderr)
@@ -25,60 +48,132 @@ def fetch(url, retries=2):
                 time.sleep(5)
     return None  # 单个源失败不中断整体任务
 
+def domain_rule(d):
+    """域名清洗后转为 ||domain^，非法则返回 None"""
+    d = d.lstrip("*.").rstrip(".").lower()
+    if not d or d in LOCAL_NAMES:
+        return None
+    if IP_RE.match(d) or DOMAIN_RE.match(d):
+        return f"||{d}^"
+    return None
+
 def normalize(line):
     line = line.strip()
-    # 去掉空行、注释行（! # [Adblock Plus] 等来源标记）
+    # 空行、注释行（! # [Adblock Plus] 等来源标记）
     if not line or line.startswith(COMMENT_PREFIXES):
         return None
-    # 剔除白名单/例外规则，只保留阻止规则
+    # 白名单/例外规则：只保留阻止规则
     if line.startswith("@@"):
         return None
-    # hosts 格式（0.0.0.0 domain）转换为 adblock 拦截语法 ||domain^
+    # 浏览器端装饰规则（元素隐藏、CSS 注入），AdGuard Home 不支持
+    if any(tok in line for tok in COSMETIC_TOKENS):
+        return None
+    # dnsmasq 格式：address=/domain/0.0.0.0 或 server=/domain/
+    m = DNSMASQ_RE.match(line)
+    if m:
+        return domain_rule(m.group(1))
+    # hosts 格式：0.0.0.0 domain [# comment]
     m = HOSTS_RE.match(line)
     if m:
-        d = m.group(1).lower()
-        if d in ("localhost", "local", "broadcasthost") or not DOMAIN_RE.match(d):
-            return None
-        return f"||{d}^"
-    # 保留拦截类 adblock 规则（||domain^、|http、正则 /.../）
+        return domain_rule(m.group(1))
+    # 标准拦截类 adblock 规则（||domain^、|http、正则 /.../）
     if line.startswith(("||", "|http")) or (line.startswith("/") and line.endswith("/")):
         return line
-    # 纯域名也转换为 ||domain^
-    if DOMAIN_RE.match(line):
-        return f"||{line.lower()}^"
-    return None  # 其余视为无效行丢弃
+    # 通配或纯域名
+    return domain_rule(line)
+
+def dedupe_key(rule):
+    """去重键：正则规则保持原样（大小写敏感），其余大小写不敏感"""
+    return rule if rule.startswith("/") else rule.lower()
+
+def prune_redundant_subdomains(rules):
+    """父域已被纯域名规则覆盖时，剔除冗余的子域纯规则（||sub.example.com^ vs ||example.com^）"""
+    pure = {}    # 行号 -> 域名
+    domains = set()
+    for i, r in enumerate(rules):
+        m = PURE_DOMAIN_RULE_RE.match(r)
+        if m:
+            pure[i] = m.group(1)
+            domains.add(m.group(1))
+    out = []
+    removed = 0
+    for i, r in enumerate(rules):
+        d = pure.get(i)
+        if d:
+            parts = d.split(".")
+            redundant = False
+            for j in range(1, len(parts) - 1):   # 依次检查各级父域（不含自身和 TLD）
+                if ".".join(parts[j:]) in domains:
+                    redundant = True
+                    break
+            if redundant:
+                removed += 1
+                continue
+        out.append(r)
+    return out, removed
+
+def write_output(path, rules, part=None, total_parts=None, total_rules=None):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    header = ["! Title: Merged AdGuard Home Filter (block rules only)"]
+    if part is not None:
+        header[0] += f" [Part {part}/{total_parts}]"
+    header += [
+        f"! Updated: {now} UTC",
+        f"! Rules: {len(rules)}" + (f" (total {total_rules})" if total_rules else ""),
+        "! Expires: 1 day",
+        "! Homepage: auto-generated by GitHub Actions",
+        "",
+    ]
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(header + rules) + "\n")
+    size_mb = os.path.getsize(path) / 1024 / 1024
+    print(f"  写入 {path}: {len(rules)} 条, {size_mb:.1f} MB")
 
 def main():
+    # 清理上一次运行遗留的输出文件，避免残留过期分片
+    for old in glob.glob("adguard-filter*.txt"):
+        os.remove(old)
+
     with open(SOURCES_FILE, encoding="utf-8") as f:
         urls = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    print(f"共 {len(urls)} 个规则源")
 
     rules, seen = [], set()
+    failed = 0
     for url in urls:
         print(f"拉取: {url}")
         text = fetch(url)
         if text is None:
+            failed += 1
             print(f"  [skip] 源不可用，跳过: {url}", file=sys.stderr)
             continue
         kept = 0
         for line in text.splitlines():
             r = normalize(line)
-            if r and r not in seen:   # 有序去重
-                seen.add(r)
+            if r is None:
+                continue
+            k = dedupe_key(r)
+            if k not in seen:   # 有序去重（大小写不敏感）
+                seen.add(k)
                 rules.append(r)
                 kept += 1
         print(f"  有效规则: {kept}")
 
-    header = [
-        "! Title: Merged AdGuard Home Filter (block rules only)",
-        f"! Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
-        f"! Rules: {len(rules)}",
-        "! Expires: 1 day",
-        "! Homepage: auto-generated by GitHub Actions",
-        "",
-    ]
-    with open(OUTPUT_FILE, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(header + rules) + "\n")
-    print(f"完成，共 {len(rules)} 条拦截规则 -> {OUTPUT_FILE}")
+    rules, pruned = prune_redundant_subdomains(rules)
+    if pruned:
+        print(f"剔除父域已覆盖的冗余子域规则: {pruned} 条")
+
+    if len(rules) <= CHUNK_LINES:
+        write_output(OUTPUT_SINGLE, rules)
+    else:
+        parts = [rules[i:i + CHUNK_LINES] for i in range(0, len(rules), CHUNK_LINES)]
+        for i, chunk in enumerate(parts, 1):
+            write_output(OUTPUT_PART_FMT.format(i), chunk,
+                         part=i, total_parts=len(parts), total_rules=len(rules))
+
+    print(f"完成，共 {len(rules)} 条拦截规则（{len(urls) - failed}/{len(urls)} 个源成功）")
+    if failed:
+        print(f"注意：{failed} 个源拉取失败已跳过", file=sys.stderr)
 
 if __name__ == "__main__":
     main()
