@@ -4,7 +4,8 @@
 设计目标：稳定优先、长期免维护、支持大量规则源、支持超大输出（50M+）。
 - 仅使用 Python 标准库，无第三方依赖
 - 单个源失败自动跳过并重试，不中断整体任务
-- 输出超过 CHUNK_LINES 行时自动分片为多个文件，规避 GitHub 单文件大小限制
+- 单文件优先：默认汇总为一个 adguard-filter.txt；仅当文件超过 GitHub
+  100MB 硬限制的安全线（90MB）时才应急分片，保证推送永不失败
 
 清洗与去重策略：
 - 白名单剔除：@@ 开头的例外规则、#@# 元素白名单全部丢弃
@@ -15,6 +16,7 @@
 - 去重：大小写不敏感的完全去重 + 父域已拦截时剔除冗余子域规则
 """
 import glob
+import math
 import os
 import re
 import sys
@@ -23,9 +25,10 @@ import urllib.request
 from datetime import datetime, timezone
 
 SOURCES_FILE = "sources.txt"
-OUTPUT_SINGLE = "adguard-filter.txt"        # 规则量不大时的单文件输出
-OUTPUT_PART_FMT = "adguard-filter-{}.txt"   # 超大时分片输出（从 1 开始编号）
-CHUNK_LINES = 800_000                        # 每片约 80 万行（约 35~45MB）
+OUTPUT_SINGLE = "adguard-filter.txt"        # 默认单文件汇总输出
+OUTPUT_PART_FMT = "adguard-filter-{}.txt"   # 超限时应急分片输出（从 1 开始编号）
+SIZE_LIMIT_MB = 90                           # 单文件安全上限（GitHub 硬限制 100MB）
+PART_TARGET_MB = 45                          # 应急分片时每片目标大小
 
 COMMENT_PREFIXES = ("!", "#", "[")
 COSMETIC_TOKENS = ("##", "#@#", "#?#", "#$#", "#@%#")
@@ -163,10 +166,17 @@ def main():
     if pruned:
         print(f"剔除父域已覆盖的冗余子域规则: {pruned} 条")
 
-    if len(rules) <= CHUNK_LINES:
-        write_output(OUTPUT_SINGLE, rules)
-    else:
-        parts = [rules[i:i + CHUNK_LINES] for i in range(0, len(rules), CHUNK_LINES)]
+    # 单文件优先：先汇总写入一个文件
+    write_output(OUTPUT_SINGLE, rules)
+    size_mb = os.path.getsize(OUTPUT_SINGLE) / 1024 / 1024
+
+    if size_mb > SIZE_LIMIT_MB:
+        # 应急分片：仅当超过 GitHub 100MB 硬限制的安全线才拆分
+        print(f"[warn] 单文件 {size_mb:.1f} MB 超过 {SIZE_LIMIT_MB} MB 安全线，自动分片", file=sys.stderr)
+        os.remove(OUTPUT_SINGLE)
+        parts_count = math.ceil(size_mb / PART_TARGET_MB)
+        chunk_lines = math.ceil(len(rules) / parts_count)
+        parts = [rules[i:i + chunk_lines] for i in range(0, len(rules), chunk_lines)]
         for i, chunk in enumerate(parts, 1):
             write_output(OUTPUT_PART_FMT.format(i), chunk,
                          part=i, total_parts=len(parts), total_rules=len(rules))
