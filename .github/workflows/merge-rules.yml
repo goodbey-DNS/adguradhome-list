@@ -4,7 +4,7 @@ name: Merge AdGuard Home Rules
 # 因此修改 sources.txt / merge.py 等文件提交后不会自动启动更新。
 on:
   schedule:
-    - cron: "0 20 * * *"   # 每天 UTC 20:00 = 北京时间凌晨 04:00
+    - cron: "30 20 * * *"  # 每天 UTC 20:30 = 北京时间凌晨 04:30（避开整点高峰，降低被 GitHub 跳过的概率）
   workflow_dispatch:        # 仅当在 Actions 页面手动点击 Run workflow 时才运行
 
 # GitHub 平台机制：仓库 60 天无 activity 会自动禁用定时任务（bot 提交不算 activity）。
