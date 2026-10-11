@@ -41,11 +41,11 @@ DOMAIN_RE = re.compile(r"^(?:[a-z0-9_-]+\.)+[a-z]{2,}$", re.IGNORECASE)
 IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 PURE_DOMAIN_RULE_RE = re.compile(r"^\|\|([a-z0-9._-]+)\^$")
 
-def fetch(url, retries=1):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+def fetch(url, retries=2):
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=120) as r:
                 return r.read().decode("utf-8", errors="ignore")
         except Exception as e:
             print(f"  [warn] 第 {attempt + 1} 次拉取失败: {e}", file=sys.stderr)
@@ -56,8 +56,8 @@ def fetch(url, retries=1):
 def fetch_all(urls, workers=5):
     """5 路并发拉取全部源，返回 {url: text or None}，保持输入顺序。
 
-    串行最坏耗时：20 源 × (3 次尝试 × 120s + 2 次间隔 × 5s) ≈ 123 分钟，会撞
-    上工作流 60 分钟超时；并发后最坏 ≈ (20/5) × 370s ≈ 25 分钟，余量充足。"""
+    串行最坏耗时：20 源 × (3 次尝试 × 120s + 2 次间隔 × 5s) ≈ 123 分钟，会撞上
+    工作流 90 分钟超时；5 路并发后最坏 ≈ ceil(20/5) × 370s ≈ 25 分钟，余量充足。"""
     results = {}
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for url, text in zip(urls, ex.map(fetch, urls)):
