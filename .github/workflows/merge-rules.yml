@@ -23,7 +23,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          default_branch=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
+          # 此步骤在 checkout 之前运行，工作区没有 .git，
+          # 必须显式传仓库名（Actions 内置变量），不能依赖当前目录解析
+          default_branch=$(gh api "repos/${{ github.repository }}" -q .default_branch)
           echo "当前默认分支: $default_branch"
           if [ "$default_branch" = "filter" ]; then
             echo "::error::仓库默认分支不能设为 filter：定时任务要求 workflow 文件在默认分支上，且 filter 分支每次运行都会被强推覆盖。请把默认分支改回 main。"
@@ -38,7 +40,7 @@ jobs:
         with:
           python-version: "3.12"   # 固定版本，长期稳定
 
-      - name: 合并规则（20 源 5 路并发拉取）
+      - name: 合并规则（多源并发拉取）
         run: python merge.py
 
       - name: 推送结果到 filter 分支（单提交强推，仓库体积不膨胀）
