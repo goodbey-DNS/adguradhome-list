@@ -7,17 +7,14 @@
 - 单文件优先：默认汇总为一个 adguard-filter.txt；仅当文件超过 GitHub
   100MB 硬限制的安全线（90MB）时才应急分片，保证推送永不失败
 
-清洗与去重策略：
-- 白名单剔除：@@ 开头的例外规则、#@# 元素白名单全部丢弃
-- 装饰规则剔除：## #?# #$# 等浏览器端元素隐藏/CSS 注入规则（AdGuard Home 不支持）
-- hosts 转换：0.0.0.0/127.0.0.1/::1 条目（含行尾注释、多余空格）-> ||domain^
-- 通配格式转换：*.example.com 补全为 ||*.example.com^（保持通配语义），
-  ||*.example.com 等带 || 的通配规则原样保留
-- 规则形态收敛：仅保留 ||domain^ 与通配形态；||... 里 $ 及其后的修饰符一律丢弃；
-  带路径的 |http/||domain/path 规则与 /正则/ 规则丢弃；通配格式的域名不做修改
-  （*. 子域通配补全 || 锚定、||*.example.com 原样保留）；统一小写
-- 域名严格校验：标签不允许 - 开头/结尾、不含下划线，排除脏数据
-- 去重：大小写不敏感完全去重；父域与子域规则均原样保留，不做父子域剔除
+清洗策略（严格保留基础规则）：
+- 保留：基础 adblock 阻止规则（||domain^ 形态，含 ||*.*.com^ 通配）原样保留，
+  不改写修饰符/路径/大小写，父域子域均不动
+- 删除：非基础形态——@@ 与 #@# 白名单放行、注释、## 装饰、$修饰符、路径规则、
+  正则规则、dnsmasq、|http 等（AdGuard Home 无法解析，非基础阻止规则）
+- 转换：基础 hosts 语法（0.0.0.0/127.0.0.1/::1 域名）-> ||域名^；
+  localhost 等本机域名除外
+- 去重：大小写不敏感完全去重，保留先出现规则的原始写法
 """
 import glob
 import math
@@ -37,14 +34,11 @@ PART_TARGET_MB = 45                          # 应急分片时每片目标大小
 MIN_RULES = 100_000                          # 结果少于此行数视为异常，终止且不覆盖线上版本
 
 COMMENT_PREFIXES = ("!", "#", "[")
-COSMETIC_TOKENS = ("##", "#@#", "#?#", "#$#", "#@%#")
 LOCAL_NAMES = {"localhost", "local", "broadcasthost", "localhost.localdomain"}
 HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1|::1)\s+([^\s#]+)")
-# 域名严格校验：标签不允许 - 开头/结尾、不含下划线，排除脏数据
-DOMAIN_RE = re.compile(
-    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$",
-    re.IGNORECASE,
-)
+IP_PREFIXES = ("0.0.0.0", "127.0.0.1", "::1")
+# 基础 adblock 阻止规则：||域名^ 形态，域名部分允许字母数字连字符下划线点与 *
+BASIC_RULE_RE = re.compile(r"^\|\|[A-Za-z0-9._*-]+\^$")
 
 def fetch(url, retries=2):
     for attempt in range(retries + 1):
@@ -69,63 +63,33 @@ def fetch_all(urls, workers=5):
             results[url] = text
     return results
 
-def domain_rule(d):
-    """域名清洗后转为 ||domain^，非法则返回 None"""
-    d = d.lstrip("*.").rstrip(".").lower()
-    if not d or d in LOCAL_NAMES:
-        return None
-    if DOMAIN_RE.match(d):
-        return f"||{d}^"
-    return None
-
-def block_rule(line):
-    """|| 开头的规则：丢弃 $ 修饰符；通配格式原样保留；纯域名收敛为 ||域名^；无法收敛则丢弃"""
-    pattern = line.split("$", 1)[0].strip().lower()
-    body = pattern[2:]
-    if "/" in body:            # 带路径的 URL 规则，AdGuard Home 按主机名匹配用不到
-        return None
-    if "*" in body:            # 通配格式的域名：不做修改，原样保留（仅统一小写）
-        return pattern
-    if body.endswith("^"):
-        body = body[:-1]
-    body = body.rstrip("|")    # ||域名| 这类尾锚点写法
-    return domain_rule(body)   # 复用域名校验：补 ^，丢弃非法域名与本机域名
-
 def normalize(line):
+    """严格保留基础规则：基础 adblock 阻止规则原样，hosts 转 ||域名^，其余全删"""
     line = line.strip()
     # 空行、注释行（! # [Adblock Plus] 等来源标记）
     if not line or line.startswith(COMMENT_PREFIXES):
         return None
-    # 白名单/例外规则：只保留阻止规则
-    if line.startswith("@@"):
+    # 白名单放行规则：@@ 与 #@# 例外，删除
+    if line.startswith("@@") or line.startswith("#@#"):
         return None
-    # 浏览器端装饰规则（元素隐藏、CSS 注入），AdGuard Home 不支持
-    if any(tok in line for tok in COSMETIC_TOKENS):
-        return None
-    # hosts 格式：0.0.0.0 domain [# comment]
+    # hosts 语法：0.0.0.0 domain [# comment] -> ||domain^
     m = HOSTS_RE.match(line)
     if m:
-        return domain_rule(m.group(1))
-    # IP 前缀但无空白（如 0.0.0.0example.com）：malformed hosts 脏数据，丢弃
-    if line.startswith(("0.0.0.0", "127.0.0.1", "::1")):
+        d = m.group(1).rstrip(".")
+        if not d or d.lower() in LOCAL_NAMES:   # 本机域名转换会拦截本机解析
+            return None
+        return f"||{d}^"
+    # hosts 语法但无域名（裸 IP / 纯注释行 / 无空格脏数据）：丢弃
+    if line.startswith(IP_PREFIXES):
         return None
-    # 标准拦截类 adblock 规则：统一收敛成 ||domain^
-    if line.startswith("||"):
-        return block_rule(line)
-    # URL/路径类规则与正则规则：不是 ||domain^，丢弃
-    if line.startswith("|http") or (line.startswith("/") and line.endswith("/")):
-        return None
-    # 通配格式的域名（如 *.example.com）：保持通配语义，补全为 ||*.域名^ 供 AdGuard 识别
-    if "*" in line:
-        d = line.lstrip("*.").rstrip(".")
-        if d and DOMAIN_RE.match(d):
-            return f"||*.{d}^"
-        return None
-    # 纯域名
-    return domain_rule(line)
+    # 基础 adblock 阻止规则（||域名^ 含通配）：原样保留
+    if BASIC_RULE_RE.match(line):
+        return line
+    # 其余一切非基础形态（##装饰、$修饰符、路径、正则、dnsmasq、|http、裸域名等）：删除
+    return None
 
 def dedupe_key(rule):
-    """去重键：全部规则已统一小写，直接大小写不敏感去重"""
+    """去重键：统一小写，实现大小写不敏感完全去重；输出保留原始写法"""
     return rule.lower()
 
 def write_output(path, rules, part=None, total_parts=None, total_rules=None):
