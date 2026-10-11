@@ -17,27 +17,35 @@ concurrency:
 jobs:
   merge:
     runs-on: ubuntu-24.04     # 固定镜像版本，不随 ubuntu-latest 漂移，长期稳定
-    timeout-minutes: 60       # 兜底：任务异常挂起时自动终止
+    timeout-minutes: 90       # 兜底：任务异常挂起时自动终止
     steps:
+      - name: 前置检查（默认分支不能是 filter）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          default_branch=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)
+          echo "当前默认分支: $default_branch"
+          if [ "$default_branch" = "filter" ]; then
+            echo "::error::仓库默认分支不能设为 filter：定时任务要求 workflow 文件在默认分支上，且 filter 分支每次运行都会被强推覆盖。请把默认分支改回 main。"
+            exit 1
+          fi
+
       - name: 检出仓库
-        uses: actions/checkout@v5   # Node 24 运行时，无弃用警告
+        uses: actions/checkout@v7   # Node 24 运行时，无弃用警告
 
       - name: 安装 Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"   # 固定版本，长期稳定
 
-      - name: 合并规则
+      - name: 合并规则（20 源 5 路并发拉取）
         run: python merge.py
 
       - name: 推送结果到 filter 分支（单提交强推，仓库体积不膨胀）
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ -z "$(git status --porcelain -- 'adguard-filter*.txt')" ]; then
-            echo "规则无变化，跳过推送"
-            exit 0
-          fi
+          # 文件头每次写入新 UTC 时间戳，内容必然变化，故不设"无变化跳过"判断。
           # 输出到独立 filter 分支：每天 50M+ 文本若累积在主分支历史中，
           # 仓库会无限膨胀直至超限。孤立分支 + 强推保证历史始终只有 1 个提交。
           git checkout --orphan filter_new
