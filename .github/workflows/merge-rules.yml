@@ -7,6 +7,10 @@ on:
     - cron: "0 20 * * *"   # 每天 UTC 20:00 = 北京时间凌晨 04:00
   workflow_dispatch:        # 仅当在 Actions 页面手动点击 Run workflow 时才运行
 
+# GitHub 平台机制：仓库 60 天无 activity 会自动禁用定时任务（bot 提交不算 activity）。
+# 已选策略：接受邮件提醒——被禁用时 GitHub 会发邮件，到 Actions 页面点 Enable 即可；
+# 平时也可在 60 天内正常操作仓库一次（人工 commit/push）保持活跃。
+
 permissions:
   contents: write
 
