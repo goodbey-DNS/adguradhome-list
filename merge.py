@@ -19,6 +19,7 @@ import glob
 import math
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
 import urllib.request
@@ -29,6 +30,7 @@ OUTPUT_SINGLE = "adguard-filter.txt"        # 默认单文件汇总输出
 OUTPUT_PART_FMT = "adguard-filter-{}.txt"   # 超限时应急分片输出（从 1 开始编号）
 SIZE_LIMIT_MB = 90                           # 单文件安全上限（GitHub 硬限制 100MB）
 PART_TARGET_MB = 45                          # 应急分片时每片目标大小
+MIN_RULES = 100_000                          # 结果少于此行数视为异常，终止且不覆盖线上版本
 
 COMMENT_PREFIXES = ("!", "#", "[")
 COSMETIC_TOKENS = ("##", "#@#", "#?#", "#$#", "#@%#")
@@ -39,17 +41,28 @@ DOMAIN_RE = re.compile(r"^(?:[a-z0-9_-]+\.)+[a-z]{2,}$", re.IGNORECASE)
 IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 PURE_DOMAIN_RULE_RE = re.compile(r"^\|\|([a-z0-9._-]+)\^$")
 
-def fetch(url, retries=2):
+def fetch(url, retries=1):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=60) as r:
                 return r.read().decode("utf-8", errors="ignore")
         except Exception as e:
             print(f"  [warn] 第 {attempt + 1} 次拉取失败: {e}", file=sys.stderr)
             if attempt < retries:
                 time.sleep(5)
     return None  # 单个源失败不中断整体任务
+
+def fetch_all(urls, workers=5):
+    """5 路并发拉取全部源，返回 {url: text or None}，保持输入顺序。
+
+    串行最坏耗时：20 源 × (3 次尝试 × 120s + 2 次间隔 × 5s) ≈ 123 分钟，会撞
+    上工作流 60 分钟超时；并发后最坏 ≈ (20/5) × 370s ≈ 25 分钟，余量充足。"""
+    results = {}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for url, text in zip(urls, ex.map(fetch, urls)):
+            results[url] = text
+    return results
 
 def domain_rule(d):
     """域名清洗后转为 ||domain^，非法则返回 None"""
@@ -143,9 +156,10 @@ def main():
 
     rules, seen = [], set()
     failed = 0
+    texts = fetch_all(urls)
     for url in urls:
-        print(f"拉取: {url}")
-        text = fetch(url)
+        print(f"处理: {url}")
+        text = texts[url]
         if text is None:
             failed += 1
             print(f"  [skip] 源不可用，跳过: {url}", file=sys.stderr)
@@ -165,6 +179,16 @@ def main():
     rules, pruned = prune_redundant_subdomains(rules)
     if pruned:
         print(f"剔除父域已覆盖的冗余子域规则: {pruned} 条")
+
+    # 保底检查：大面积源失效时结果必然残缺，宁可任务失败也不覆盖线上完好版本
+    if failed * 2 > len(urls):
+        print(f"[error] {failed}/{len(urls)} 个源拉取失败（过半），终止推送，保留线上现有版本",
+              file=sys.stderr)
+        sys.exit(1)
+    if len(rules) < MIN_RULES:
+        print(f"[error] 合并结果仅 {len(rules)} 条（低于 {MIN_RULES}），疑似异常，终止推送",
+              file=sys.stderr)
+        sys.exit(1)
 
     # 单文件优先：先汇总写入一个文件
     write_output(OUTPUT_SINGLE, rules)
