@@ -11,11 +11,13 @@
 - 白名单剔除：@@ 开头的例外规则、#@# 元素白名单全部丢弃
 - 装饰规则剔除：## #?# #$# 等浏览器端元素隐藏/CSS 注入规则（AdGuard Home 不支持）
 - hosts 转换：0.0.0.0/127.0.0.1/::1 条目（含行尾注释、多余空格）-> ||domain^
-- dnsmasq 转换：address=/domain/0.0.0.0 -> ||domain^
-- 通配/纯域名转换：*.example.com、example.com -> ||example.com^
-- 规则形态收敛：仅保留 ||domain^；||... 里 $ 及其后的修饰符一律丢弃；带路径的
-  |http/||domain/path 规则与 /正则/ 规则丢弃；含 * 的通配规则原样保留；统一小写
-- 去重：大小写不敏感的完全去重 + 父域已拦截时剔除冗余子域规则
+- 通配格式转换：*.example.com 补全为 ||*.example.com^（保持通配语义），
+  ||*.example.com 等带 || 的通配规则原样保留
+- 规则形态收敛：仅保留 ||domain^ 与通配形态；||... 里 $ 及其后的修饰符一律丢弃；
+  带路径的 |http/||domain/path 规则与 /正则/ 规则丢弃；通配格式的域名不做修改
+  （*. 子域通配补全 || 锚定、||*.example.com 原样保留）；统一小写
+- 域名严格校验：标签不允许 - 开头/结尾、不含下划线，排除脏数据
+- 去重：大小写不敏感完全去重；父域与子域规则均原样保留，不做父子域剔除
 """
 import glob
 import math
@@ -38,10 +40,11 @@ COMMENT_PREFIXES = ("!", "#", "[")
 COSMETIC_TOKENS = ("##", "#@#", "#?#", "#$#", "#@%#")
 LOCAL_NAMES = {"localhost", "local", "broadcasthost", "localhost.localdomain"}
 HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1|::1)\s+([^\s#]+)")
-DNSMASQ_RE = re.compile(r"^(?:address|server)=/([^/\s]+)/")
-DOMAIN_RE = re.compile(r"^(?:[a-z0-9_-]+\.)+[a-z]{2,}$", re.IGNORECASE)
-IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-PURE_DOMAIN_RULE_RE = re.compile(r"^\|\|([a-z0-9._-]+)\^$")
+# 域名严格校验：标签不允许 - 开头/结尾、不含下划线，排除脏数据
+DOMAIN_RE = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$",
+    re.IGNORECASE,
+)
 
 def fetch(url, retries=2):
     for attempt in range(retries + 1):
@@ -71,21 +74,21 @@ def domain_rule(d):
     d = d.lstrip("*.").rstrip(".").lower()
     if not d or d in LOCAL_NAMES:
         return None
-    if IP_RE.match(d) or DOMAIN_RE.match(d):
+    if DOMAIN_RE.match(d):
         return f"||{d}^"
     return None
 
 def block_rule(line):
-    """|| 开头的规则：丢弃 $ 及其后修饰符，统一收敛为小写 ||domain^；无法收敛则丢弃"""
+    """|| 开头的规则：丢弃 $ 修饰符；通配格式原样保留；纯域名收敛为 ||域名^；无法收敛则丢弃"""
     pattern = line.split("$", 1)[0].strip().lower()
     body = pattern[2:]
-    if "*" in body:            # 含通配的规则无法收敛成纯域名，原样保留（仅统一小写）
-        return pattern
     if "/" in body:            # 带路径的 URL 规则，AdGuard Home 按主机名匹配用不到
         return None
+    if "*" in body:            # 通配格式的域名：不做修改，原样保留（仅统一小写）
+        return pattern
     if body.endswith("^"):
         body = body[:-1]
-    body = body.rstrip("|")    # ||domain| 这类尾锚点写法
+    body = body.rstrip("|")    # ||域名| 这类尾锚点写法
     return domain_rule(body)   # 复用域名校验：补 ^，丢弃非法域名与本机域名
 
 def normalize(line):
@@ -99,52 +102,31 @@ def normalize(line):
     # 浏览器端装饰规则（元素隐藏、CSS 注入），AdGuard Home 不支持
     if any(tok in line for tok in COSMETIC_TOKENS):
         return None
-    # dnsmasq 格式：address=/domain/0.0.0.0 或 server=/domain/
-    m = DNSMASQ_RE.match(line)
-    if m:
-        return domain_rule(m.group(1))
     # hosts 格式：0.0.0.0 domain [# comment]
     m = HOSTS_RE.match(line)
     if m:
         return domain_rule(m.group(1))
+    # IP 前缀但无空白（如 0.0.0.0example.com）：malformed hosts 脏数据，丢弃
+    if line.startswith(("0.0.0.0", "127.0.0.1", "::1")):
+        return None
     # 标准拦截类 adblock 规则：统一收敛成 ||domain^
     if line.startswith("||"):
         return block_rule(line)
     # URL/路径类规则与正则规则：不是 ||domain^，丢弃
     if line.startswith("|http") or (line.startswith("/") and line.endswith("/")):
         return None
-    # 通配或纯域名
+    # 通配格式的域名（如 *.example.com）：保持通配语义，补全为 ||*.域名^ 供 AdGuard 识别
+    if "*" in line:
+        d = line.lstrip("*.").rstrip(".")
+        if d and DOMAIN_RE.match(d):
+            return f"||*.{d}^"
+        return None
+    # 纯域名
     return domain_rule(line)
 
 def dedupe_key(rule):
-    """去重键：正则规则保持原样（大小写敏感），其余大小写不敏感"""
-    return rule if rule.startswith("/") else rule.lower()
-
-def prune_redundant_subdomains(rules):
-    """父域已被纯域名规则覆盖时，剔除冗余的子域纯规则（||sub.example.com^ vs ||example.com^）"""
-    pure = {}    # 行号 -> 域名
-    domains = set()
-    for i, r in enumerate(rules):
-        m = PURE_DOMAIN_RULE_RE.match(r)
-        if m:
-            pure[i] = m.group(1)
-            domains.add(m.group(1))
-    out = []
-    removed = 0
-    for i, r in enumerate(rules):
-        d = pure.get(i)
-        if d:
-            parts = d.split(".")
-            redundant = False
-            for j in range(1, len(parts) - 1):   # 依次检查各级父域（不含自身和 TLD）
-                if ".".join(parts[j:]) in domains:
-                    redundant = True
-                    break
-            if redundant:
-                removed += 1
-                continue
-        out.append(r)
-    return out, removed
+    """去重键：全部规则已统一小写，直接大小写不敏感去重"""
+    return rule.lower()
 
 def write_output(path, rules, part=None, total_parts=None, total_rules=None):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -193,10 +175,6 @@ def main():
                 rules.append(r)
                 kept += 1
         print(f"  有效规则: {kept}")
-
-    rules, pruned = prune_redundant_subdomains(rules)
-    if pruned:
-        print(f"剔除父域已覆盖的冗余子域规则: {pruned} 条")
 
     # 保底检查：大面积源失效时结果必然残缺，宁可任务失败也不覆盖线上完好版本
     if failed * 2 > len(urls):
