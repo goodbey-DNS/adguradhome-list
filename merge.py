@@ -13,8 +13,12 @@
 - 删除：非基础形态——@@ 与 #@# 白名单放行、注释、## 装饰、$修饰符、路径规则、
   正则规则、dnsmasq、|http 等（AdGuard Home 无法解析，非基础阻止规则）
 - 转换：基础 hosts 语法（0.0.0.0/127.0.0.1/::1 域名）-> ||域名^；
-  localhost 等本机域名除外
+  localhost 等本机域名、非合法域名/IP 的脏数据除外
 - 去重：大小写不敏感完全去重，保留先出现规则的原始写法
+
+运维加固：
+- 单源响应超过 256MB 直接判失败跳过，防超大响应耗尽 runner 内存
+- sources.txt 缺失或为空时给出明确报错信息（而非裸 FileNotFoundError）
 """
 import glob
 import math
@@ -32,11 +36,19 @@ OUTPUT_PART_FMT = "adguard-filter-{}.txt"   # 超限时应急分片输出（从 
 SIZE_LIMIT_MB = 90                           # 单文件安全上限（GitHub 硬限制 100MB）
 PART_TARGET_MB = 45                          # 应急分片时每片目标大小
 MIN_RULES = 100_000                          # 结果少于此行数视为异常，终止且不覆盖线上版本
+MAX_SOURCE_BYTES = 256 * 1024 * 1024         # 单源响应上限：超此值判失败跳过，防 OOM
 
 COMMENT_PREFIXES = ("!", "#", "[")
 LOCAL_NAMES = {"localhost", "local", "broadcasthost", "localhost.localdomain"}
 HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1|::1)\s+([^\s#]+)")
 IP_PREFIXES = ("0.0.0.0", "127.0.0.1", "::1")
+# hosts 域名位合法性校验：合法域名（label 不允许 - 开头/结尾、不含通配）或 IPv4，
+# 防止 -example.com 等脏数据混入输出
+HOSTS_DOMAIN_RE = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$",
+    re.IGNORECASE,
+)
+HOSTS_IP_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 # 基础 adblock 阻止规则：||域名^ 形态，域名部分允许字母数字连字符下划线点与 *
 BASIC_RULE_RE = re.compile(r"^\|\|[A-Za-z0-9._*-]+\^$")
 
@@ -45,7 +57,12 @@ def fetch(url, retries=2):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=120) as r:
-                return r.read().decode("utf-8", errors="ignore")
+                data = r.read(MAX_SOURCE_BYTES + 1)   # 多读 1 字节探测超限
+                if len(data) > MAX_SOURCE_BYTES:
+                    print(f"  [warn] 源超过 {MAX_SOURCE_BYTES // 1024 // 1024}MB 上限，跳过: {url}",
+                          file=sys.stderr)
+                    return None
+                return data.decode("utf-8", errors="ignore")
         except Exception as e:
             print(f"  [warn] 第 {attempt + 1} 次拉取失败: {e}", file=sys.stderr)
             if attempt < retries:
@@ -77,6 +94,8 @@ def normalize(line):
     if m:
         d = m.group(1).rstrip(".")
         if not d or d.lower() in LOCAL_NAMES:   # 本机域名转换会拦截本机解析
+            return None
+        if not (HOSTS_DOMAIN_RE.match(d) or HOSTS_IP_RE.match(d)):   # 脏数据丢弃
             return None
         return f"||{d}^"
     # hosts 语法但无域名（裸 IP / 纯注释行 / 无空格脏数据）：丢弃
@@ -114,8 +133,15 @@ def main():
     for old in glob.glob("adguard-filter*.txt"):
         os.remove(old)
 
+    if not os.path.exists(SOURCES_FILE):
+        print(f"[error] 缺少 {SOURCES_FILE}：请确认它已提交到仓库根目录（与 merge.py 同级），"
+              f"每行一个规则源 URL，# 开头为注释。", file=sys.stderr)
+        sys.exit(1)
     with open(SOURCES_FILE, encoding="utf-8") as f:
         urls = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    if not urls:
+        print(f"[error] {SOURCES_FILE} 为空：没有可用的规则源。", file=sys.stderr)
+        sys.exit(1)
     print(f"共 {len(urls)} 个规则源")
 
     rules, seen = [], set()
