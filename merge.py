@@ -10,13 +10,15 @@
 清洗策略（严格保留基础规则）：
 - 保留：基础 adblock 阻止规则（||domain^ 形态，含 ||*.*.com^ 通配）原样保留，
   不改写修饰符/路径/大小写，父域子域均不动
-- 删除：非基础形态——@@ 与 #@# 白名单放行、注释、## 装饰、$修饰符、路径规则、
-  正则规则、dnsmasq、|http 等（AdGuard Home 无法解析，非基础阻止规则）
-- 转换：基础 hosts 语法（0.0.0.0/127.0.0.1/::1 域名）-> ||域名^；
+- 删除：@@ 白名单放行、注释（含 #@# 元素例外行）、## 装饰、$修饰符、路径规则、
+  正则规则、dnsmasq、|http 等其余一切非 ||域名^ 形态（AdGuard Home 无法解析）
+- 转换：基础 hosts 语法（0.0.0.0/127.0.0.1/::1 域名，含一行多域名）-> ||域名^；
   localhost 等本机域名、非合法域名/IP 的脏数据除外
 - 去重：大小写不敏感完全去重，保留先出现规则的原始写法
 
 运维加固：
+- 拉取解码用 utf-8-sig：自动剥除部分源文件开头的 BOM，
+  否则该源第一条规则会因 \ufeff 前缀被误判为非法而丢失
 - 单源响应超过 256MB 直接判失败跳过，防超大响应耗尽 runner 内存
 - sources.txt 缺失或为空时给出明确报错信息（而非裸 FileNotFoundError）
 """
@@ -40,8 +42,11 @@ MAX_SOURCE_BYTES = 256 * 1024 * 1024         # 单源响应上限：超此值判
 
 COMMENT_PREFIXES = ("!", "#", "[")
 LOCAL_NAMES = {"localhost", "local", "broadcasthost", "localhost.localdomain"}
-HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1|::1)\s+([^\s#]+)")
+# hosts 目标为回环/未指定地址本身时无拦截意义，||127.0.0.1^ 还会误伤本机回环解析
+LOCAL_IPS = {"0.0.0.0", "127.0.0.1", "::1"}
 IP_PREFIXES = ("0.0.0.0", "127.0.0.1", "::1")
+# hosts 行：0.0.0.0 domain [domain...] [# comment]，支持一行多域名
+HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1|::1)(?:\s+([^#]+))?")
 # hosts 域名位合法性校验：合法域名（label 不允许 - 开头/结尾、不含通配）或 IPv4，
 # 防止 -example.com 等脏数据混入输出
 HOSTS_DOMAIN_RE = re.compile(
@@ -62,7 +67,9 @@ def fetch(url, retries=2):
                     print(f"  [warn] 源超过 {MAX_SOURCE_BYTES // 1024 // 1024}MB 上限，跳过: {url}",
                           file=sys.stderr)
                     return None
-                return data.decode("utf-8", errors="ignore")
+                # utf-8-sig：自动剥除部分源文件开头的 BOM，
+                # 否则该源第一条规则会因 \ufeff 前缀被误判为非法行而丢失
+                return data.decode("utf-8-sig", errors="ignore")
         except Exception as e:
             print(f"  [warn] 第 {attempt + 1} 次拉取失败: {e}", file=sys.stderr)
             if attempt < retries:
@@ -80,32 +87,37 @@ def fetch_all(urls, workers=5):
             results[url] = text
     return results
 
+def hosts_rules(line):
+    """hosts 行解析：0.0.0.0 domain [domain...] [# comment] -> 多条 ||域名^"""
+    m = HOSTS_RE.match(line)
+    if not m or not m.group(1):   # 裸 IP / 纯注释行 / 无空格脏数据
+        return []
+    out = []
+    for tok in m.group(1).split():
+        d = tok.rstrip(".")
+        if not d or d.lower() in LOCAL_NAMES or d in LOCAL_IPS:
+            continue
+        if HOSTS_DOMAIN_RE.match(d) or HOSTS_IP_RE.match(d):   # 脏数据丢弃
+            out.append(f"||{d}^")
+    return out
+
 def normalize(line):
-    """严格保留基础规则：基础 adblock 阻止规则原样，hosts 转 ||域名^，其余全删"""
+    """严格保留基础规则：返回规则列表（基础规则单条/hosts 转换零或多条/其余为空）"""
     line = line.strip()
     # 空行、注释行（! # [Adblock Plus] 等来源标记）
     if not line or line.startswith(COMMENT_PREFIXES):
-        return None
-    # 白名单放行规则：@@ 与 #@# 例外，删除
-    if line.startswith("@@") or line.startswith("#@#"):
-        return None
-    # hosts 语法：0.0.0.0 domain [# comment] -> ||domain^
-    m = HOSTS_RE.match(line)
-    if m:
-        d = m.group(1).rstrip(".")
-        if not d or d.lower() in LOCAL_NAMES:   # 本机域名转换会拦截本机解析
-            return None
-        if not (HOSTS_DOMAIN_RE.match(d) or HOSTS_IP_RE.match(d)):   # 脏数据丢弃
-            return None
-        return f"||{d}^"
-    # hosts 语法但无域名（裸 IP / 纯注释行 / 无空格脏数据）：丢弃
+        return []
+    # 白名单放行规则：@@ 例外，删除
+    if line.startswith("@@"):
+        return []
+    # hosts 语法：0.0.0.0 domain [domain...] [# comment] -> ||域名^（可能多条）
     if line.startswith(IP_PREFIXES):
-        return None
+        return hosts_rules(line)
     # 基础 adblock 阻止规则（||域名^ 含通配）：原样保留
     if BASIC_RULE_RE.match(line):
-        return line
+        return [line]
     # 其余一切非基础形态（##装饰、$修饰符、路径、正则、dnsmasq、|http、裸域名等）：删除
-    return None
+    return []
 
 def dedupe_key(rule):
     """去重键：统一小写，实现大小写不敏感完全去重；输出保留原始写法"""
@@ -156,14 +168,12 @@ def main():
             continue
         kept = 0
         for line in text.splitlines():
-            r = normalize(line)
-            if r is None:
-                continue
-            k = dedupe_key(r)
-            if k not in seen:   # 有序去重（大小写不敏感）
-                seen.add(k)
-                rules.append(r)
-                kept += 1
+            for r in normalize(line):
+                k = dedupe_key(r)
+                if k not in seen:   # 有序去重（大小写不敏感）
+                    seen.add(k)
+                    rules.append(r)
+                    kept += 1
         print(f"  有效规则: {kept}")
 
     # 保底检查：大面积源失效时结果必然残缺，宁可任务失败也不覆盖线上完好版本
