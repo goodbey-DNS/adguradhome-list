@@ -34,6 +34,8 @@ jobs:
 
       - name: 检出仓库
         uses: actions/checkout@v7   # Node 24 运行时，无弃用警告
+        with:
+          fetch-depth: 1            # 只取最新提交：孤儿分支强推无需历史，避免全量克隆
 
       - name: 安装 Python
         uses: actions/setup-python@v7
