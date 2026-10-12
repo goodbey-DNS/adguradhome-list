@@ -8,13 +8,13 @@
   100MB 硬限制的安全线（90MB）时才应急分片，保证推送永不失败
 
 清洗策略（严格保留基础规则）：
-- 保留：基础 adblock 阻止规则（||domain^ 形态，含 ||*.*.com^ 通配）原样保留，
-  不改写修饰符/路径/大小写，父域子域均不动
+- 保留：基础 adblock 阻止规则（||domain^ 形态，含 ||*.*.com^ 通配）
+  统一小写输出（风格一致，符合 adblock 书写惯例），父域子域均不动
 - 删除：@@ 白名单放行、注释（含 #@# 元素例外行）、## 装饰、$修饰符、路径规则、
   正则规则、dnsmasq、|http 等其余一切非 ||域名^ 形态（AdGuard Home 无法解析）
-- 转换：基础 hosts 语法（0.0.0.0/127.0.0.1/::1 域名，含一行多域名）-> ||域名^；
+- 转换：基础 hosts 语法（0.0.0.0/127.0.0.1/::1 域名，含一行多域名）-> ||域名^（统一小写）；
   localhost 等本机域名、非合法域名/IP 的脏数据除外
-- 去重：大小写不敏感完全去重，保留先出现规则的原始写法
+- 去重：完全去重（已统一小写）
 
 运维加固：
 - 拉取解码用 utf-8-sig：自动剥除部分源文件开头的 BOM，
@@ -98,7 +98,7 @@ def hosts_rules(line):
         if not d or d.lower() in LOCAL_NAMES or d in LOCAL_IPS:
             continue
         if HOSTS_DOMAIN_RE.match(d) or HOSTS_IP_RE.match(d):   # 脏数据丢弃
-            out.append(f"||{d}^")
+            out.append(f"||{d.lower()}^")
     return out
 
 def normalize(line):
@@ -113,15 +113,15 @@ def normalize(line):
     # hosts 语法：0.0.0.0 domain [domain...] [# comment] -> ||域名^（可能多条）
     if line.startswith(IP_PREFIXES):
         return hosts_rules(line)
-    # 基础 adblock 阻止规则（||域名^ 含通配）：原样保留
+    # 基础 adblock 阻止规则（||域名^ 含通配）：统一小写输出（风格一致，符合 adblock 书写惯例）
     if BASIC_RULE_RE.match(line):
-        return [line]
+        return [line.lower()]
     # 其余一切非基础形态（##装饰、$修饰符、路径、正则、dnsmasq、|http、裸域名等）：删除
     return []
 
 def dedupe_key(rule):
-    """去重键：统一小写，实现大小写不敏感完全去重；输出保留原始写法"""
-    return rule.lower()
+    """去重键：规则已统一小写，直接完全去重"""
+    return rule
 
 def write_output(path, rules, part=None, total_parts=None, total_rules=None):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
