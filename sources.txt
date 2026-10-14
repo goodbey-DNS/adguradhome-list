@@ -19,3 +19,4 @@ https://raw.githubusercontent.com/hoshsadiq/adblock-nocoin-list/master/hosts.txt
 https://phishing.army/download/phishing-army-adblock.txt
 https://raw.githubusercontent.com/durablenapkin/scamblocklist/master/hosts.txt
 https://adguardteam.github.io/HostlistsRegistry/assets/filter_42.txt
+https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/nsfw.txt
