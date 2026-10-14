@@ -14,7 +14,6 @@ https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/native.huawei.t
 https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/native.tiktok.txt
 https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/native.tiktok.extended.txt
 https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/native.winoffice.txt
-https://raw.githubusercontent.com/AdguardTeam/FiltersRegistry/master/filters/filter_2_Base/filter.txt
 https://raw.githubusercontent.com/hoshsadiq/adblock-nocoin-list/master/hosts.txt
 https://phishing.army/download/phishing-army-adblock.txt
 https://raw.githubusercontent.com/durablenapkin/scamblocklist/master/hosts.txt
